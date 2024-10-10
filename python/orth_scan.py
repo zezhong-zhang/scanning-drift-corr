@@ -349,10 +349,10 @@ class OrthScan:
         weights = np.stack(
             [
                 (1 - dx) * (1 - dy),  # top-left weight
-                dx * (1 - dy),  # top-right weight
-                (1 - dx) * dy,  # bottom-left weight
-                dx * dy,
-            ],  # bottom-right weight
+                dx * (1 - dy),        # top-right weight
+                (1 - dx) * dy,        # bottom-left weight
+                dx * dy,              # bottom-right weight
+            ],  
             axis=-1,
         )  # Stack along the last axis
         ind_all = np.ravel_multi_index(
