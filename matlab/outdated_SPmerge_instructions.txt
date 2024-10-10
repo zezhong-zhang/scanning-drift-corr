@@ -36,7 +36,7 @@ image were flipped 180 degrees in the two-image plot, we would need to use
 a scanline direction of either -90 or 270 degrees in SPmerge01.m.
 
 2.  Next, initialize the correction struct:
->> sMerge = SPmerge01([0 90],image00deg,image90deg);
+>> sMerge = SPmerge01linear([0 90],image00deg,image90deg);
 
 The initial alignment appears quite poor, due to the nonlinear drift.  This 
 is not a problem, as the drift and alignment  will be corrected in subsequent 
