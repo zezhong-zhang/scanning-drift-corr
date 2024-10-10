@@ -238,6 +238,30 @@ class OrthScan:
             self.scan_origin[:, :, i] += xyshifts
             self.generate_trial_images(i)
 
+    def find_reference_point(self):
+        """
+        Find the reference point for the images according to the min difference between the transformed images
+        """
+        ya, xa = np.meshgrid(
+            np.arange(1, self.image_size[1] + 1) - self.image_size[1] / 2,
+            np.arange(1, self.image_size[0] + 1) - self.image_size[0] / 2,
+        )
+
+        # Compute the weight matrix
+        weight = (
+            (xa**2 / (self.image_size[0] ** 2 / 4))
+            + (ya**2 / (self.image_size[1] ** 2 / 4))
+            + 1
+        )
+        diff_weighted = self.image_transform.std(axis=2) * weight
+        mask = np.min(self.image_density == 1, axis=2) == 1
+        diff_weighted[~mask] = np.max(diff_weighted)
+
+        # gaussian filter to smooth the difference
+        diff_weighted = gaussian_filter(diff_weighted, 5)
+        #  Extract reference point
+        self.ref_point = np.unravel_index(np.argmin(diff_weighted), diff_weighted.shape)
+
     def init_alignment(self):
         """
         Estimate the initial alignment between images.
