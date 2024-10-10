@@ -9,22 +9,20 @@ class OrthScan:
     def __init__(
         self,
         images,
-        scan_angles=[0, 90],
+        scan_angles=(0, 90),
         low_pass_sigma=32,
-        report_progress=True,
         padding_scale=1.5,
         kde_sigma=0.5,
         edge_width=1 / 128,
         linear_search_steps=2,
     ):
         """
-        Initialize the DriftCorrector class to align and drift correct scanning probe images.
+        Initialize the OrthScan class to align and drift correct scanning probe images.
 
         Parameters:
         - images: 3D numpy array or a list of 2D numpy arrays (the input images).
         - scan_angles: list of angles in degrees.
         - low_pass_sigma: sigma value for low-pass filter (default is 32).
-        - report_progress: boolean to show progress in the console.
         - padding_scale: scale factor for padding the images.
         - kde_sigma: smoothing factor for KDE.
         - edge_width: width of the blending edge relative to input images.
@@ -32,12 +30,13 @@ class OrthScan:
         """
         self.scan_angles = scan_angles
         self.low_pass_sigma = low_pass_sigma
-        self.report_progress = report_progress
         self.padding_scale = padding_scale
         self.kde_sigma = kde_sigma
         self.edge_width = edge_width
 
-        # Initialize the sMerge struct
+        if isinstance(images, np.ndarray) and images.ndim == 3:
+            images = [images[i] for i in range(images.shape[0])]
+
         self.image_size = np.array(
             [
                 int(np.round(images[0].shape[0] * padding_scale / 4) * 4),
@@ -48,7 +47,7 @@ class OrthScan:
         self.scan_lines = np.zeros(
             (images[0].shape[0], images[0].shape[1], self.num_images)
         )
-        self.time_inds = np.linspace(
+        self.time_index = np.linspace(
             -0.5, 0.5, self.scan_lines.shape[0]
         )  # Indices used for time-dependent linear drift calculation.
         self.w2 = np.zeros(self.image_size)  # Hanning window for hybrid correlation
@@ -72,6 +71,9 @@ class OrthScan:
             self.scan_lines[:, :, i] = img
             self.calculate_scan_origins(i, img)
 
+        self.linear_search_score_1 = None
+        self.linear_search_score_2 = None
+
         # Prepare for the linear drift search
 
     def run_linear_alignment(self):
@@ -79,31 +81,40 @@ class OrthScan:
         self.refine_linear()
         self.apply_linear()
         self.init_alignment()
+        self.find_reference_point()
         self.show_alignment()
 
     def calculate_scan_origins(self, index, image):
         """
-        Calculate scan origins based on the image and its scan angle.
+        Calculate scan origins based on the image dimensions and scan angle.
         """
         height, width = image.shape
-        xy = np.zeros((height, 2))
-        xy[:, 0] = np.arange(1, height + 1) - height / 2
-        xy[:, 1] = 1 - width / 2
 
+        # Create the xy coordinates centered around the image center
+        xy = np.column_stack(
+            (np.arange(height) - height / 2, np.full(height, -width / 2))
+        )
+
+        # Compute rotation matrix based on scan angle
         angle_rad = np.radians(self.scan_angles[index])
-        c, s = np.cos(angle_rad), np.sin(angle_rad)
-        rotation_matrix = np.array([[c, -s], [s, c]])
+        rotation_matrix = np.array(
+            [
+                [np.cos(angle_rad), -np.sin(angle_rad)],
+                [np.sin(angle_rad), np.cos(angle_rad)],
+            ]
+        )
+
+        # Rotate and translate xy coordinates
         xy_rotated = xy @ rotation_matrix.T
-        xy_rotated[:, 0] += self.image_size[0] / 2
-        xy_rotated[:, 1] += self.image_size[1] / 2
-        xy_rotated[:, 0] -= np.mod(xy_rotated[0, 0], 1)
-        xy_rotated[:, 1] -= np.mod(xy_rotated[0, 1], 1)
-        xy_rotated = np.round(xy_rotated) - 1
+        xy_rotated += np.array([self.image_size[0] / 2, self.image_size[1] / 2])
+
+        # Round and adjust to 0-based indexing
+        xy_rotated = np.floor(xy_rotated).astype(int)
 
         # Store scan origins
         self.scan_origin[:, :, index] = xy_rotated
 
-        # Calculate the scan direction
+        # Calculate and store scan direction (rotated 90 degrees)
         self.scan_direction[index, :] = [
             np.cos(angle_rad + np.pi / 2),
             np.sin(angle_rad + np.pi / 2),
@@ -113,25 +124,26 @@ class OrthScan:
         """
         Perform a search for linear drift vectors between images.
         """
-
         y_drift, x_drift = np.meshgrid(self.linear_search, self.linear_search)
         self.linear_search_score_1 = np.zeros_like(x_drift)
 
-        # Create the hanning window
+        # Create the Hanning window
         N = self.scan_lines.shape[:2]
-        window = self.hanning_local(N[0])[:, None] * self.hanning_local(N[1])[None, :]
-        self.w2[
-            (self.image_size[0] - N[0]) // 2 : (self.image_size[0] + N[0]) // 2,
-            (self.image_size[1] - N[1]) // 2 : (self.image_size[1] + N[1]) // 2,
-        ] = window
+        window = np.outer(self.hanning_local(N[0]), self.hanning_local(N[1]))
 
+        # Place the Hanning window in the center of the image space
+        h_start = (self.image_size[0] - N[0]) // 2
+        w_start = (self.image_size[1] - N[1]) // 2
+        self.w2[h_start : h_start + N[0], w_start : w_start + N[1]] = window
+
+        # Iterate over the search space using x_drift and y_drift
         for i, j in tqdm(
             np.ndindex(x_drift.shape),
             total=x_drift.size,
             desc="Initial Linear Drift Search",
         ):
             xy_shift = np.stack(
-                [x_drift[i, j] * self.time_inds, y_drift[i, j] * self.time_inds],
+                [x_drift[i, j] * self.time_index, y_drift[i, j] * self.time_index],
                 axis=-1,
             )
 
@@ -140,26 +152,23 @@ class OrthScan:
             self.generate_trial_images(0)
             self.generate_trial_images(1)
 
-            # Measure alignment score using hybrid correlation
+            # Compute hybrid correlation to measure alignment
             m = fft2d(self.w2 * self.image_transform[:, :, 0]) * np.conj(
                 fft2d(self.w2 * self.image_transform[:, :, 1])
             )
-
             correlation_matrix = np.abs(
                 ifft2d(np.sqrt(np.abs(m)) * np.exp(1j * np.angle(m)))
             )
 
+            # Store the maximum correlation score
             self.linear_search_score_1[i, j] = np.max(correlation_matrix)
 
-            # Remove linear drift
+            # Revert linear drift for the next iteration
             self.scan_origin[:, :, :2] -= xy_shift[:, :, None]
 
     def refine_linear(self):
         """
         Perform the second linear alignment to refine possible linear drift vectors.
-
-        Parameters:
-        - flag_report_progress: Boolean flag to enable or disable progress reporting.
         """
         # Find the maximum score from the first linear search
         max_index = np.argmax(self.linear_search_score_1)
@@ -169,32 +178,28 @@ class OrthScan:
         step = self.linear_search[1] - self.linear_search[0]
 
         # Refine the search grid around the best initial guess
-        x_refine = (
-            self.linear_search[x_ind]
-            + np.linspace(-0.5, 0.5, len(self.linear_search)) * step
-        )
-        y_refine = (
-            self.linear_search[y_ind]
-            + np.linspace(-0.5, 0.5, len(self.linear_search)) * step
-        )
+        refine_range = np.linspace(-0.5, 0.5, len(self.linear_search)) * step
+        x_refine = self.linear_search[x_ind] + refine_range
+        y_refine = self.linear_search[y_ind] + refine_range
         y_drift, x_drift = np.meshgrid(y_refine, x_refine)
 
         # Initialize score matrix for the second linear search
         self.linear_search_score_2 = np.zeros_like(self.linear_search_score_1)
 
+        # Precompute time-dependent shifts for efficiency
+        x_shifts = self.time_index[:, None] * x_drift.flatten()
+        y_shifts = self.time_index[:, None] * y_drift.flatten()
+
         # Loop over all refined search grid points
-        for a0, a1 in tqdm(
-            np.ndindex(x_drift.shape),
+        for idx, (x_shift, y_shift) in tqdm(
+            enumerate(zip(x_shifts.T, y_shifts.T)),
             total=x_drift.size,
             desc="Refined Linear Drift Search",
         ):
-            # Calculate time-dependent linear drift shift
-            xy_shift = np.column_stack(
-                (self.time_inds * x_drift[a0, a1], self.time_inds * y_drift[a0, a1])
-            )
-
-            # Apply linear drift to the first two images
-            self.scan_origin[:, :, :2] += xy_shift[:, :, None]
+            # Apply the linear drift shift to both images simultaneously
+            self.scan_origin[:, :, :2] += np.stack([x_shift, y_shift], axis=-1)[
+                :, :, None
+            ]
 
             # Generate trial images for the first two images
             self.generate_trial_images(0)
@@ -209,10 +214,13 @@ class OrthScan:
                 ifft2d(np.sqrt(np.abs(m)) * np.exp(1j * np.angle(m)))
             )
 
-            self.linear_search_score_2[a0, a1] = np.max(correlation_matrix)
+            # Store the maximum correlation score
+            self.linear_search_score_2.ravel()[idx] = np.max(correlation_matrix)
 
-            # Remove linear drift from the first two images
-            self.scan_origin[:, :, :2] -= xy_shift[:, :, None]
+            # Revert the linear drift shift
+            self.scan_origin[:, :, :2] -= np.stack([x_shift, y_shift], axis=-1)[
+                :, :, None
+            ]
 
         # Find the maximum score from the second linear search
         max_index = np.argmax(self.linear_search_score_2)
@@ -230,8 +238,8 @@ class OrthScan:
         # Apply the linear drift to all images
         xyshifts = np.column_stack(
             (
-                self.time_inds * self.linear_drift[0],
-                self.time_inds * self.linear_drift[1],
+                self.time_index * self.linear_drift[0],
+                self.time_index * self.linear_drift[1],
             )
         )
         for i in range(self.num_images):
@@ -313,13 +321,9 @@ class OrthScan:
             ind_lines = np.ones(self.scan_lines.shape[0], dtype=bool)
 
         # Expand coordinates for resampling
-        t = np.tile(np.arange(self.scan_lines.shape[1]), (np.sum(ind_lines), 1))
-        x0 = np.tile(
-            self.scan_origin[ind_lines, 0, ind_image], (self.scan_lines.shape[1], 1)
-        ).T
-        y0 = np.tile(
-            self.scan_origin[ind_lines, 1, ind_image], (self.scan_lines.shape[1], 1)
-        ).T
+        t = np.arange(self.scan_lines.shape[1])
+        x0 = self.scan_origin[ind_lines, 0, ind_image][:, None]
+        y0 = self.scan_origin[ind_lines, 1, ind_image][:, None]
 
         x_ind = x0 + t * self.scan_direction[ind_image, 0]
         y_ind = y0 + t * self.scan_direction[ind_image, 1]
@@ -399,11 +403,11 @@ class OrthScan:
             plt.imshow(sig, cmap="gray")
             plt.savefig("image_transform.png")
 
-    def hanning_local(self, N):
+    def hanning_local(self, n):
         """
         Replacement for 1D hanning function to avoid dependency.
         """
-        return np.sin(np.pi * (np.arange(1, N + 1) / (N + 1))) ** 2
+        return np.sin(np.pi * (np.arange(1, n + 1) / (n + 1))) ** 2
 
     def show_alignment(self):
         """
