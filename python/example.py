@@ -26,7 +26,7 @@ final_image = osc.generate_final_image(upsample_factor=2,
                                         fourier_weighting=True)
 # Display results
 # %%
-osc.diagnostic_plot()# %%
+osc.visualize_alignment()# %%
 
 
 # %%

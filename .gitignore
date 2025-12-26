@@ -1,2 +1,5 @@
 paper/
 python/__pycache__/
+.kiro/
+paper_content.txt
+read_paper.py
