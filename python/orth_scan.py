@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.ndimage import gaussian_filter, distance_transform_edt, binary_dilation
-from scipy.signal import convolve
+from scipy.ndimage import distance_transform_edt, binary_dilation
+from scipy.signal import convolve, convolve2d
 from tqdm import tqdm
 from typing import List, Optional, Tuple
 import warnings
@@ -46,11 +46,11 @@ class OrthScan:
             int(np.round(images[0].shape[1] * padding_scale / 4) * 4)
         ])
         
-        # Set edge width if not specified
+        # Set edge width - stored as fraction matching MATLAB's sMerge.edgeWidth = 1/128
         if edge_width is None:
-            self.edge_width = np.mean(self.image_size) / 128
+            self.edge_width = 1.0 / 128
         else:
-            self.edge_width = edge_width * np.mean(self.image_size)
+            self.edge_width = edge_width
             
         self.num_images = len(scan_angles)
         
@@ -81,14 +81,17 @@ class OrthScan:
         self.stats = []
         
     def _calculate_initial_scan_origins(self, index):
-        """Calculate initial scan origins and directions."""
+        """Calculate initial scan origins and directions.
+        Matches MATLAB: xy = [(1:height)' ones(height,1)]; 
+        xy(:,1) = xy(:,1) - height/2; xy(:,2) = xy(:,2) - width/2;
+        """
         height, width = self.scan_lines[:, :, index].shape
         
-        # Create coordinates using Python's 0-based indexing
-        # Convert MATLAB's (1:height) - height/2 to Python's (0:height-1) - (height-1)/2
+        # Match MATLAB: xy(:,1) = (1:height) - height/2
+        #               xy(:,2) = ones(height,1) - width/2
         xy = np.column_stack([
-            np.arange(height) - (height - 1) / 2,  # 0-based: center at (height-1)/2
-            np.zeros(height) - (width - 1) / 2     # 0-based: center at (width-1)/2
+            np.arange(1, height + 1) - height / 2,
+            np.ones(height) - width / 2
         ])
         
         # Rotate by scan angle
@@ -99,9 +102,9 @@ class OrthScan:
             xy[:, 0] * sin_a + xy[:, 1] * cos_a
         ])
         
-        # Translate to padded image center (0-based coordinates)
-        xy_rot[:, 0] = xy_rot[:, 0] + (self.image_size[0] - 1) / 2
-        xy_rot[:, 1] = xy_rot[:, 1] + (self.image_size[1] - 1) / 2
+        # Translate to padded image center: MATLAB uses imageSize/2
+        xy_rot[:, 0] = xy_rot[:, 0] + self.image_size[0] / 2
+        xy_rot[:, 1] = xy_rot[:, 1] + self.image_size[1] / 2
         
         # Remove fractional offset to align to pixel grid
         xy_rot[:, 0] = xy_rot[:, 0] - (xy_rot[0, 0] % 1)
@@ -125,6 +128,7 @@ class OrthScan:
     def make_image(self, ind_image, ind_lines=None):
         """
         Generate resampled image from scan lines (equivalent to SPmakeImage).
+        Matches MATLAB: t = 1:width, clamp to [1, imageSize-1].
         
         Parameters:
         - ind_image: Index of image to generate
@@ -133,27 +137,32 @@ class OrthScan:
         if ind_lines is None:
             ind_lines = np.ones(self.scan_lines.shape[0], dtype=bool)
             
-        # Expand coordinates using Python's 0-based indexing
-        t = np.arange(self.scan_lines.shape[1]).reshape(1, -1)  # 0 to width-1
+        # Expand coordinates matching MATLAB: t = 1:width (1-based pixel steps)
+        t = np.arange(1, self.scan_lines.shape[1] + 1).reshape(1, -1)
         x0 = self.scan_origin[ind_lines, 0, ind_image].reshape(-1, 1)
         y0 = self.scan_origin[ind_lines, 1, ind_image].reshape(-1, 1)
         
         x_ind = x0 + t * self.scan_direction[ind_image, 0]
         y_ind = y0 + t * self.scan_direction[ind_image, 1]
         
-        # Clip to image boundaries (0-based: 0 to size-1)
-        x_ind = np.clip(x_ind.flatten(), 0, self.image_size[0] - 1)
-        y_ind = np.clip(y_ind.flatten(), 0, self.image_size[1] - 1)
+        # Clip to image boundaries matching MATLAB: max(min(xInd,imageSize-1),1)
+        # Note: coordinates are in MATLAB-equivalent space [1, imageSize]
+        # Valid bilinear range is [1, imageSize-1] so floor gives [1, imageSize-1]
+        # and floor+1 gives [2, imageSize], both valid 1-based indices.
+        # We use 0-based arrays, so subtract 1 for actual array indexing below.
+        x_ind = np.clip(x_ind.flatten(), 1, self.image_size[0] - 1)
+        y_ind = np.clip(y_ind.flatten(), 1, self.image_size[1] - 1)
         
-        # Bilinear interpolation using 0-based coordinates
+        # Bilinear interpolation
         x_floor = np.floor(x_ind).astype(int)
         y_floor = np.floor(y_ind).astype(int)
         dx = x_ind - x_floor
         dy = y_ind - y_floor
         
-        # Ensure indices are within bounds for 0-based arrays
-        x_floor = np.clip(x_floor, 0, self.image_size[0] - 1)
-        y_floor = np.clip(y_floor, 0, self.image_size[1] - 1)
+        # Convert to 0-based indices for array access
+        # MATLAB sub2ind uses 1-based, Python uses 0-based
+        xF = x_floor - 1  # 0-based
+        yF = y_floor - 1  # 0-based
         
         # Weights for bilinear interpolation
         weights = np.array([
@@ -163,14 +172,12 @@ class OrthScan:
             dx*dy
         ])
         
-        # Indices for accumulation using 0-based indexing
-        # In Python: first index is rows, second is columns
+        # Indices for accumulation (0-based array indexing)
         indices = [
-            np.ravel_multi_index((x_floor, y_floor), self.image_size),
-            np.ravel_multi_index((np.minimum(x_floor+1, self.image_size[0]-1), y_floor), self.image_size),
-            np.ravel_multi_index((x_floor, np.minimum(y_floor+1, self.image_size[1]-1)), self.image_size),
-            np.ravel_multi_index((np.minimum(x_floor+1, self.image_size[0]-1), 
-                                np.minimum(y_floor+1, self.image_size[1]-1)), self.image_size)
+            np.ravel_multi_index((xF, yF), self.image_size),
+            np.ravel_multi_index((xF+1, yF), self.image_size),
+            np.ravel_multi_index((xF, yF+1), self.image_size),
+            np.ravel_multi_index((xF+1, yF+1), self.image_size)
         ]
         
         # Generate image and density
@@ -185,10 +192,15 @@ class OrthScan:
         sig = sig.reshape(self.image_size)
         count = count.reshape(self.image_size)
         
-        # Apply KDE smoothing
+        # Apply KDE smoothing matching MATLAB: fspecial('gaussian',2*r+1,sigma) + conv2
         if self.kde_sigma > 0:
-            sig = gaussian_filter(sig, self.kde_sigma)
-            count = gaussian_filter(count, self.kde_sigma)
+            r = max(int(np.ceil(self.kde_sigma * 3)), 5)
+            ax = np.arange(-r, r + 1)
+            kernel_1d = np.exp(-ax**2 / (2 * self.kde_sigma**2))
+            kernel_2d = np.outer(kernel_1d, kernel_1d)
+            kernel_2d = kernel_2d / np.sum(kernel_2d)
+            sig = convolve2d(sig, kernel_2d, mode='same', boundary='fill')
+            count = convolve2d(count, kernel_2d, mode='same', boundary='fill')
             
         # Normalize
         mask = count > 0
@@ -388,7 +400,7 @@ class OrthScan:
             
         self.basis_or = np.column_stack([
             np.ones(self.scan_lines.shape[0]),
-            np.arange(self.scan_lines.shape[0])
+            np.arange(1, self.scan_lines.shape[0] + 1)  # MATLAB uses 1:N
         ])
         
     def _initial_nonlinear_alignment(self, initial_steps, dist_start, 
@@ -555,37 +567,49 @@ class OrthScan:
                 # Refine each scanline
                 for j in range(self.scan_lines.shape[0]):
                     best_score = np.inf
-                    best_shift = np.array([0.0, 0.0])
+                    best_or = self.scan_origin[j, :, i].copy()
+                    original_or = self.scan_origin[j, :, i].copy()
+                    best_idx = 0  # Default: center (no move)
                     
                     # Test 5 positions (center and 4 cardinal directions)
-                    test_shifts = np.array([
+                    # Matches MATLAB: orTest = repmat(scanOr(a1,1:2,a0),[5 1]) + dxy * scanOrStep(a1,a0)
+                    dxy = np.array([
                         [0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]
-                    ]) * self.scan_origin_step[j, i]
+                    ])
+                    or_test = np.tile(self.scan_origin[j, :, i], (5, 1)) + dxy * self.scan_origin_step[j, i]
                     
-                    for shift in test_shifts:
-                        test_or = self.scan_origin[j, :, i] + shift
-                        
-                        # Apply ordering constraint if needed
-                        if point_ordering:
-                            v_test = n[0] * test_or[0] + n[1] * test_or[1]
-                            if j > 0 and v_test < v_param[j-1]:
-                                test_or += n * (v_param[j-1] - v_test)
-                            elif j < self.scan_lines.shape[0]-1 and v_test > v_param[j+1]:
-                                test_or += n * (v_param[j+1] - v_test)
-                        
-                        score = self._calc_scanline_score(test_or, i, j, image_align)
+                    # Apply ordering constraint to ALL test positions before scoring
+                    # Matches MATLAB: compute bounds, then clamp all positions
+                    if point_ordering:
+                        v_test = n[0] * or_test[:, 0] + n[1] * or_test[:, 1]
+                        if j == 0:
+                            v_bound = [-np.inf, v_param[j+1]]
+                        elif j == self.scan_lines.shape[0] - 1:
+                            v_bound = [v_param[j-1], np.inf]
+                        else:
+                            v_bound = [v_param[j-1], v_param[j+1]]
+                        for a2 in range(5):
+                            if v_test[a2] < v_bound[0]:
+                                or_test[a2, :] += n * (v_bound[0] - v_test[a2])
+                            elif v_test[a2] > v_bound[1]:
+                                or_test[a2, :] += n * (v_bound[1] - v_test[a2])
+                    
+                    # Score all 5 test positions
+                    for a2 in range(5):
+                        score = self._calc_scanline_score(or_test[a2], i, j, image_align)
                         if score < best_score:
                             best_score = score
-                            best_shift = shift.copy()
+                            best_or = or_test[a2].copy()
+                            best_idx = a2
                     
-                    # Apply best shift
-                    if np.linalg.norm(best_shift) < 1e-6:
-                        # No improvement, reduce step size
+                    # Apply best position: MATLAB uses scanOr(a1,:,a0) = orTest(ind,:)
+                    if best_idx == 0:
+                        # No improvement (center position won), reduce step size
                         self.scan_origin_step[j, i] *= step_reduce
                     else:
-                        # Apply shift
-                        pixels_moved += np.linalg.norm(best_shift)
-                        self.scan_origin[j, :, i] += best_shift
+                        # Apply the constraint-adjusted position directly
+                        pixels_moved += np.linalg.norm(best_or - original_or)
+                        self.scan_origin[j, :, i] = best_or
             
             # Apply smoothing if specified
             if smoothing_window > 0:
@@ -604,14 +628,16 @@ class OrthScan:
         self.stats = self.stats[:align_step+1]  # Trim unused entries
         
     def _calc_scanline_score(self, origin, img_idx, line_idx, image_align):
-        """Calculate alignment score for a scanline."""
-        inds = np.arange(self.scan_lines.shape[1])
+        """Calculate alignment score for a scanline.
+        Matches MATLAB: inds = 1:width, clamp to [1, imageSize-1], bilinear interpolation.
+        """
+        inds = np.arange(1, self.scan_lines.shape[1] + 1)
         x_ind = origin[0] + inds * self.scan_direction[img_idx, 0]
         y_ind = origin[1] + inds * self.scan_direction[img_idx, 1]
         
-        # Clip to boundaries
-        x_ind = np.clip(x_ind, 0, self.image_size[0] - 1.001)
-        y_ind = np.clip(y_ind, 0, self.image_size[1] - 1.001)
+        # Clip to boundaries matching MATLAB: max(min(xInd,imageSize-1),1)
+        x_ind = np.clip(x_ind, 1, self.image_size[0] - 1)
+        y_ind = np.clip(y_ind, 1, self.image_size[1] - 1)
         
         # Bilinear interpolation
         x_floor = np.floor(x_ind).astype(int)
@@ -619,21 +645,27 @@ class OrthScan:
         dx = x_ind - x_floor
         dy = y_ind - y_floor
         
-        # Sample from alignment image
-        sample = (image_align[x_floor, y_floor] * (1-dx) * (1-dy) +
-                 image_align[np.minimum(x_floor+1, self.image_size[0]-1), y_floor] * dx * (1-dy) +
-                 image_align[x_floor, np.minimum(y_floor+1, self.image_size[1]-1)] * (1-dx) * dy +
-                 image_align[np.minimum(x_floor+1, self.image_size[0]-1), 
-                           np.minimum(y_floor+1, self.image_size[1]-1)] * dx * dy)
+        # Convert to 0-based indices for array access
+        xF = x_floor - 1
+        yF = y_floor - 1
+        
+        # Sample from alignment image using bilinear interpolation
+        # Matches MATLAB calcScore: sub2ind based bilinear
+        sample = (image_align[xF, yF] * (1-dx) * (1-dy) +
+                 image_align[xF+1, yF] * dx * (1-dy) +
+                 image_align[xF, yF+1] * (1-dx) * dy +
+                 image_align[xF+1, yF+1] * dx * dy)
         
         return np.sum(np.abs(sample - self.scan_lines[line_idx, :, img_idx]))
     
     def _global_phase_correlation(self, density_cutoff, min_shift):
-        """Apply global phase correlation alignment."""
+        """Apply global phase correlation alignment.
+        Matches MATLAB SPmerge02: uses densityDist for image 0, hardcoded 64 for others.
+        """
         pixels_moved = 0
         intensity_median = np.median(self.scan_lines)
         
-        # Reference image
+        # Reference image — use densityDist = mean(size)/32
         density_dist = np.mean(self.scan_lines.shape[:2]) / 32
         density_mask = distance_transform_edt(self.image_density[:, :, 0] < density_cutoff)
         density_mask = np.sin(np.minimum(density_mask / density_dist, 1) * np.pi/2)**2
@@ -642,9 +674,9 @@ class OrthScan:
         ref_fft = np.fft.fft2(ref_img)
         
         for i in range(1, self.num_images):
-            # Current image
+            # Current image — MATLAB uses hardcoded 64 for non-reference images
             density_mask = distance_transform_edt(self.image_density[:, :, i] < density_cutoff)
-            density_mask = np.sin(np.minimum(density_mask / density_dist, 1) * np.pi/2)**2
+            density_mask = np.sin(np.minimum(density_mask / 64.0, 1) * np.pi/2)**2
             
             curr_img = self.image_transform[:, :, i] * density_mask + (1 - density_mask) * intensity_median
             curr_fft = np.conj(np.fft.fft2(curr_img))
@@ -652,19 +684,19 @@ class OrthScan:
             # Phase correlation
             phase_corr = np.abs(np.fft.ifft2(np.exp(1j * np.angle(ref_fft * curr_fft))))
             
-            # Find peak using 0-based indexing
+            # Find peak — matches MATLAB's mod(xInd-1+imageSize/2, imageSize) - imageSize/2
             peak_idx = np.unravel_index(np.argmax(phase_corr), phase_corr.shape)
-            # Phase correlation gives shift to align current image to reference, so flip sign
             dx = ((peak_idx[0] + self.image_size[0]//2) % self.image_size[0] - self.image_size[0]//2)
             dy = ((peak_idx[1] + self.image_size[1]//2) % self.image_size[1] - self.image_size[1]//2)
             
             # Apply shift if significant
+            # Match MATLAB boundary check: min(xNew) >= 1 && max(xNew) < imageSize-1
             if abs(dx) + abs(dy) > min_shift:
                 x_new = self.scan_origin[:, 0, i] + dx
                 y_new = self.scan_origin[:, 1, i] + dy
                 
-                if (np.min(x_new) >= 0 and np.max(x_new) < self.image_size[0] - 1 and
-                    np.min(y_new) >= 0 and np.max(y_new) < self.image_size[1] - 1):
+                if (np.min(x_new) >= 1 and np.max(x_new) < self.image_size[0] - 1 and
+                    np.min(y_new) >= 1 and np.max(y_new) < self.image_size[1] - 1):
                     self.scan_origin[:, 0, i] = x_new
                     self.scan_origin[:, 1, i] = y_new
                     self.scan_origin_step[:, i] = 0.5  # Reset step size
@@ -716,35 +748,56 @@ class OrthScan:
         signal_array = np.zeros((*upsampled_size, self.num_images))
         density_array = np.zeros_like(signal_array)
         
-        # Generate KDE kernel in Fourier domain
-        qx = np.fft.fftfreq(upsampled_size[0], 1/upsampled_size[0])
-        qy = np.fft.fftfreq(upsampled_size[1], 1/upsampled_size[1])
-        qya, qxa = np.meshgrid(qy, qx)
-        kernel_fft = np.exp(-2 * np.pi**2 * self.kde_sigma**2 * (qxa**2 + qya**2))
+        # Generate KDE kernel matching MATLAB's approach:
+        # x = makeFourierCoords(N, 1/imageSize) gives pixel positions
+        # kernel = fft2(exp(-x^2/(2*sigma^2)) * exp(-y^2/(2*sigma^2)))
+        # This constructs a spatial Gaussian on the grid and FFTs it.
+        def make_fourier_coords(N, pSize):
+            """Match MATLAB's makeFourierCoords: pixel-space coordinates in FFT order."""
+            if N % 2 == 0:
+                q = np.roll(np.arange(-N//2, N//2) / (N * pSize), -N//2)
+            else:
+                q = np.roll((np.arange(-N//2+0.5, N//2+0.5)) / ((N-1) * pSize), int(-N//2+0.5))
+            return q
         
-        # Density smoothing kernel
+        x = make_fourier_coords(upsampled_size[0], 1.0/self.image_size[0]).reshape(-1, 1)
+        y = make_fourier_coords(upsampled_size[1], 1.0/self.image_size[1]).reshape(1, -1)
+        
+        kde_sigma = self.kde_sigma
+        kernel_spatial = np.exp(-x**2 / (2 * kde_sigma**2)) * np.exp(-y**2 / (2 * kde_sigma**2))
+        kernel_fft = np.fft.fft2(kernel_spatial)
+        
+        # Density smoothing kernel (matching MATLAB)
         sigma_density = 4
-        density_smooth_fft = np.exp(-2 * np.pi**2 * sigma_density**2 * (qxa**2 + qya**2) / upsample_factor**4)
+        density_spatial = (np.exp(-x**2 / (2 * sigma_density**2)) * 
+                          np.exp(-y**2 / (2 * sigma_density**2)) /
+                          (2 * np.pi * sigma_density**2 * upsample_factor**2))
+        density_smooth_fft = np.fft.fft2(density_spatial)
         
         # Process each image
         for i in tqdm(range(self.num_images), desc="Processing images for fusion"):
             # Resample at higher resolution
+            # Match MATLAB: t = 1:width, xInd = x0*upsample - (upsample-1)/2 + t*scanDir*upsample
             t = np.arange(1, self.scan_lines.shape[1] + 1)
             x0 = self.scan_origin[:, 0, i].reshape(-1, 1)
             y0 = self.scan_origin[:, 1, i].reshape(-1, 1)
             
-            x_ind = x0 * upsample_factor + (upsample_factor - 1) / 2 + t * self.scan_direction[i, 0] * upsample_factor
-            y_ind = y0 * upsample_factor + (upsample_factor - 1) / 2 + t * self.scan_direction[i, 1] * upsample_factor
+            x_ind = x0 * upsample_factor - (upsample_factor - 1) / 2 + t * self.scan_direction[i, 0] * upsample_factor
+            y_ind = y0 * upsample_factor - (upsample_factor - 1) / 2 + t * self.scan_direction[i, 1] * upsample_factor
             
-            # Clip to boundaries
-            x_ind = np.clip(x_ind.flatten(), 0, upsampled_size[0] - 1)
-            y_ind = np.clip(y_ind.flatten(), 0, upsampled_size[1] - 1)
+            # Clip to boundaries matching MATLAB: min(max(xInd,1),imageSize*upsample-1)
+            x_ind = np.clip(x_ind.flatten(), 1, upsampled_size[0] - 1)
+            y_ind = np.clip(y_ind.flatten(), 1, upsampled_size[1] - 1)
             
             # Bilinear interpolation
             x_floor = np.floor(x_ind).astype(int)
             y_floor = np.floor(y_ind).astype(int)
             dx = x_ind - x_floor
             dy = y_ind - y_floor
+            
+            # Convert to 0-based indices for array access
+            xF = x_floor - 1
+            yF = y_floor - 1
             
             if debug:
                 print("x_ind:", x_ind[:10])
@@ -759,10 +812,10 @@ class OrthScan:
             
             weights = [(1-dx)*(1-dy), dx*(1-dy), (1-dx)*dy, dx*dy]
             indices = [
-                np.ravel_multi_index((x_floor, y_floor), upsampled_size),
-                np.ravel_multi_index((x_floor + 1, y_floor), upsampled_size),
-                np.ravel_multi_index((x_floor, y_floor + 1), upsampled_size),
-                np.ravel_multi_index((x_floor + 1, y_floor + 1), upsampled_size)
+                np.ravel_multi_index((xF, yF), upsampled_size),
+                np.ravel_multi_index((xF + 1, yF), upsampled_size),
+                np.ravel_multi_index((xF, yF + 1), upsampled_size),
+                np.ravel_multi_index((xF + 1, yF + 1), upsampled_size)
             ]
             
             for idx, w in zip(indices, weights):
@@ -794,7 +847,11 @@ class OrthScan:
         # Combine images
         if fourier_weighting:
             # Fourier weighting based on scan direction
-            q_theta = np.arctan2(qya, qxa)
+            # Match MATLAB: qx = makeFourierCoords(size,1), qy = makeFourierCoords(size,1)
+            qx_w = make_fourier_coords(upsampled_size[0], 1.0)
+            qy_w = make_fourier_coords(upsampled_size[1], 1.0)
+            qya_w, qxa_w = np.meshgrid(qy_w, qx_w)
+            q_theta = np.arctan2(qya_w, qxa_w)
             final_fft = np.zeros(upsampled_size, dtype=complex)
             weight_total = np.zeros(upsampled_size)
             
@@ -821,10 +878,12 @@ class OrthScan:
         # Downsample if requested
         if downsample_output and upsample_factor > 1:
             # Fourier cropping for downsampling
+            # Match MATLAB: xVec = [(1:N/2) ((-N/2+1):0) + N*upsample]
+            # In 0-based: [0:N/2-1] and [-N/2+1:0] mapped to upsampled indices
             x_vec = list(range(self.image_size[0]//2)) + \
-                   list(range(-self.image_size[0]//2 + 1, 0))
+                   list(range(-self.image_size[0]//2 + 1, 1))  # includes 0
             y_vec = list(range(self.image_size[1]//2)) + \
-                   list(range(-self.image_size[1]//2 + 1, 0))
+                   list(range(-self.image_size[1]//2 + 1, 1))  # includes 0
             
             x_vec = [(x + upsampled_size[0]) % upsampled_size[0] for x in x_vec]
             y_vec = [(y + upsampled_size[1]) % upsampled_size[1] for y in y_vec]
